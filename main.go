@@ -13,6 +13,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,13 +22,17 @@ import (
 )
 
 type ProcessInfo struct {
-	PID      int     `json:"pid"`
-	UUID     string  `json:"uuid"`
-	CPUUsage float64 `json:"cpu_usage"`
-	VirtMB   float64 `json:"virt_mb"`
-	ResMB    float64 `json:"res_mb"`
-	ShrMB    float64 `json:"shr_mb"`
-	OOMScore int     `json:"oom_score"`
+	PID          int     `json:"pid"`
+	UUID         string  `json:"uuid"`
+	CPUUsage     float64 `json:"cpu_usage"`
+	CPUCores     int     `json:"cpu_cores"`
+	CPUUsagePerc float64 `json:"cpu_usage_perc"`
+	VirtMB       float64 `json:"virt_mb"`
+	ResMB        float64 `json:"res_mb"`
+	ShrMB        float64 `json:"shr_mb"`
+	AllocatedMB  int     `json:"allocated_mb"`
+	MemUsagePerc float64 `json:"mem_usage_perc"`
+	OOMScore     int     `json:"oom_score"`
 }
 
 type Config struct {
@@ -49,6 +54,18 @@ const (
 	moveUp          = "\033[1A"
 )
 
+const (
+	colorReset  = "\033[0m"
+	colorRed    = "\033[31m"
+	colorGreen  = "\033[32m"
+	colorYellow = "\033[33m"
+	colorBlue   = "\033[34m"
+	colorPurple = "\033[35m"
+	colorCyan   = "\033[36m"
+	colorWhite  = "\033[37m"
+	colorBold   = "\033[1m"
+)
+
 var (
 	uuidRegex   = regexp.MustCompile(`/run/vm/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/`)
 	lastOutput  []string
@@ -64,6 +81,37 @@ func getCurrentUsername() string {
 		log.Fatal(err)
 	}
 	return currentUser.Username
+}
+
+func parseAllocatedResources(pid int) (cpuCores int, memoryMB int) {
+	cmd := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command", "--no-headers")
+	output, err := cmd.Output()
+	if err != nil {
+		return 1, 0
+	}
+
+	cmdLine := string(output)
+
+	smpRegex := regexp.MustCompile(`-smp\s+(\d+)`)
+	if matches := smpRegex.FindStringSubmatch(cmdLine); len(matches) > 1 {
+		cpuCores, _ = strconv.Atoi(matches[1])
+	}
+
+	memRegex := regexp.MustCompile(`-m\s+(\d+)(M|G)?`)
+	if matches := memRegex.FindStringSubmatch(cmdLine); len(matches) > 1 {
+		mem, _ := strconv.Atoi(matches[1])
+		unit := "M"
+		if len(matches) > 2 {
+			unit = matches[2]
+		}
+		if unit == "G" {
+			memoryMB = mem * 1024
+		} else {
+			memoryMB = mem
+		}
+	}
+
+	return cpuCores, memoryMB
 }
 
 func getQemuProcesses(username string) []int {
@@ -169,43 +217,105 @@ func getProcessInfo(pid int) ProcessInfo {
 	virtMB, resMB, shrMB := getMemoryInfo(pid)
 	oomScore := getOOMScore(pid)
 	uuid := getProcessUUID(pid)
+	cpuCores, allocatedMB := parseAllocatedResources(pid)
+
+	cpuUsagePerc := cpuUsage / float64(cpuCores)
+	memUsagePerc := resMB / float64(allocatedMB) * 100
 
 	return ProcessInfo{
-		PID:      pid,
-		UUID:     uuid,
-		CPUUsage: cpuUsage,
-		VirtMB:   virtMB,
-		ResMB:    resMB,
-		ShrMB:    shrMB,
-		OOMScore: oomScore,
+		PID:          pid,
+		UUID:         uuid,
+		CPUUsage:     cpuUsage,
+		CPUCores:     cpuCores,
+		CPUUsagePerc: cpuUsagePerc,
+		VirtMB:       virtMB,
+		ResMB:        resMB,
+		ShrMB:        shrMB,
+		AllocatedMB:  allocatedMB,
+		MemUsagePerc: memUsagePerc,
+		OOMScore:     oomScore,
+	}
+}
+
+func formatHeader() string {
+	return fmt.Sprintf(colorBold+"%-8s  %-36s  %-16s  %-16s  %-16s  %-10s"+colorReset,
+		"PID",
+		"UUID",
+		"CPU(used/max)",
+		"MEM(used/max)",
+		"USAGE(cpu/mem)",
+		"OOM",
+	)
+}
+
+// 格式化数值为人类可读格式
+func formatMemory(mb float64) string {
+	if mb >= 1024 {
+		return fmt.Sprintf("%.1fG", mb/1024)
+	}
+	return fmt.Sprintf("%.0fM", mb)
+}
+
+func getUsageColor(usage float64) string {
+	switch {
+	case usage >= 90:
+		return colorRed
+	case usage >= 75:
+		return colorYellow
+	default:
+		return colorGreen
 	}
 }
 
 func formatProcessLine(info ProcessInfo) string {
-	return fmt.Sprintf("%-10d %-37s %-10.1f %-15.2f %-15.2f %-15.2f %-10d",
-		info.PID, info.UUID, info.CPUUsage, info.VirtMB, info.ResMB, info.ShrMB, info.OOMScore)
+	// 计算使用率颜色
+	cpuColor := getUsageColor(info.CPUUsagePerc)
+	memColor := getUsageColor(info.MemUsagePerc)
+
+	// 格式化内存数值
+	usedMem := formatMemory(info.ResMB)
+	totalMem := formatMemory(float64(info.AllocatedMB))
+
+	return fmt.Sprintf("%-8d  %-36s  %s%5.1f%%/%-4d%s  %s%-7s/%-7s%s  %s%5.1f%%%s/%s%5.1f%%%s  %-10d",
+		info.PID,
+		info.UUID,
+		colorBlue, info.CPUUsage, info.CPUCores, colorReset,
+		colorBlue, usedMem, totalMem, colorReset,
+		cpuColor, info.CPUUsagePerc, colorReset,
+		memColor, info.MemUsagePerc, colorReset,
+		info.OOMScore,
+	)
 }
 
 func getHeader() []string {
+	timeStr := time.Now().Format("2006-01-02 15:04:05")
 	return []string{
-		fmt.Sprintf("QEMU Processes Monitor - %s", time.Now().Format("2006-01-02 15:04:05")),
-		"Press Ctrl+C to exit",
-		"----------------------------------------",
-		fmt.Sprintf("%-10s %-37s %-10s %-15s %-15s %-15s %-10s",
-			"PID", "UUID", "CPU%", "VIRT(MB)", "RES(MB)", "SHR(MB)", "OOM_SCORE"),
+		fmt.Sprintf(colorBold+"QEMU Processes Monitor - %s"+colorReset, timeStr),
+		fmt.Sprintf(colorCyan + "Press Ctrl+C to exit" + colorReset),
+		strings.Repeat("─", 120), // 使用更好看的分隔线
+		formatHeader(),
+		strings.Repeat("─", 120),
 	}
 }
 
+// 优化显示函数
 func updateDisplay(processes []ProcessInfo) {
 	var currentOutput []string
 
-	// Generate current output content
+	// 生成当前输出内容
 	currentOutput = append(currentOutput, getHeader()...)
+
+	// 按 CPU 使用率排序
+	sort.Slice(processes, func(i, j int) bool {
+		return processes[i].CPUUsagePerc > processes[j].CPUUsagePerc
+	})
+
 	for _, info := range processes {
 		currentOutput = append(currentOutput, formatProcessLine(info))
 	}
+	currentOutput = append(currentOutput, strings.Repeat("─", 120))
 
-	// If it's the first output, clear the screen and print all content
+	// 如果是第一次输出，清屏并打印所有内容
 	if len(lastOutput) == 0 {
 		fmt.Print(clearScreen + moveToTop)
 		for _, line := range currentOutput {
@@ -215,20 +325,17 @@ func updateDisplay(processes []ProcessInfo) {
 		return
 	}
 
-	// Move to the top of the screen
+	// 移动到屏幕顶部
 	fmt.Print(moveToTop)
 
-	// Update changed lines, keep unchanged lines as is
+	// 更新发生变化的行
 	maxLines := max(len(currentOutput), len(lastOutput))
 	for i := 0; i < maxLines; i++ {
-		// Clear current line
 		fmt.Print(clearLine)
-
-		// Print current line content
 		if i < len(currentOutput) {
 			fmt.Println(currentOutput[i])
 		} else {
-			fmt.Println() // Print empty line to clear excess old lines
+			fmt.Println()
 		}
 	}
 
@@ -270,10 +377,19 @@ func handlePrometheus(w http.ResponseWriter, r *http.Request) {
 
 	// Write Prometheus metrics
 	for _, p := range processData.info {
+		fmt.Fprintf(w, "# HELP qemu_process_cpu_usage CPU usage in percentage per core\n")
 		fmt.Fprintf(w, "qemu_process_cpu_usage{pid=\"%d\",uuid=\"%s\"} %f\n", p.PID, p.UUID, p.CPUUsage)
-		fmt.Fprintf(w, "qemu_process_memory_virtual_mb{pid=\"%d\",uuid=\"%s\"} %f\n", p.PID, p.UUID, p.VirtMB)
-		fmt.Fprintf(w, "qemu_process_memory_resident_mb{pid=\"%d\",uuid=\"%s\"} %f\n", p.PID, p.UUID, p.ResMB)
-		fmt.Fprintf(w, "qemu_process_memory_shared_mb{pid=\"%d\",uuid=\"%s\"} %f\n", p.PID, p.UUID, p.ShrMB)
+		fmt.Fprintf(w, "# HELP qemu_process_cpu_cores Allocated CPU cores\n")
+		fmt.Fprintf(w, "qemu_process_cpu_cores{pid=\"%d\",uuid=\"%s\"} %d\n", p.PID, p.UUID, p.CPUCores)
+		fmt.Fprintf(w, "# HELP qemu_process_cpu_usage_percentage CPU usage percentage relative to allocated cores\n")
+		fmt.Fprintf(w, "qemu_process_cpu_usage_percentage{pid=\"%d\",uuid=\"%s\"} %f\n", p.PID, p.UUID, p.CPUUsagePerc)
+		fmt.Fprintf(w, "# HELP qemu_process_memory_usage_mb Current memory usage in MB\n")
+		fmt.Fprintf(w, "qemu_process_memory_usage_mb{pid=\"%d\",uuid=\"%s\"} %f\n", p.PID, p.UUID, p.ResMB)
+		fmt.Fprintf(w, "# HELP qemu_process_memory_allocated_mb Allocated memory in MB\n")
+		fmt.Fprintf(w, "qemu_process_memory_allocated_mb{pid=\"%d\",uuid=\"%s\"} %d\n", p.PID, p.UUID, p.AllocatedMB)
+		fmt.Fprintf(w, "# HELP qemu_process_memory_usage_percentage Memory usage percentage\n")
+		fmt.Fprintf(w, "qemu_process_memory_usage_percentage{pid=\"%d\",uuid=\"%s\"} %f\n", p.PID, p.UUID, p.MemUsagePerc)
+		fmt.Fprintf(w, "# HELP qemu_process_oom_score OOM score\n")
 		fmt.Fprintf(w, "qemu_process_oom_score{pid=\"%d\",uuid=\"%s\"} %d\n", p.PID, p.UUID, p.OOMScore)
 	}
 }
