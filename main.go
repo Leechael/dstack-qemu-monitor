@@ -105,6 +105,24 @@ var (
 	}
 )
 
+// SystemInfo represents the host system resource information
+type SystemInfo struct {
+	TotalCPUs     int     // Total number of CPU cores
+	TotalMemoryMB int     // Total system memory in MB
+	LoadAvg1      float64 // 1 minute load average
+	LoadAvg5      float64 // 5 minute load average
+	LoadAvg15     float64 // 15 minute load average
+}
+
+// Summary represents the aggregated resource usage of all QEMU processes
+type Summary struct {
+	ProcessCount  int     // Number of QEMU processes
+	TotalCPUUsage float64 // Total CPU usage percentage
+	TotalMemoryMB float64 // Total memory usage in MB
+	TotalCores    int     // Total allocated CPU cores
+	TotalMemAlloc int     // Total allocated memory in MB
+}
+
 // getCurrentUsername returns the current user's username
 func getCurrentUsername() string {
 	currentUser, err := user.Current()
@@ -281,7 +299,7 @@ func getProcessInfo(pid int) ProcessInfo {
 
 // formatHeader returns the formatted header string for the display
 func formatHeader() string {
-	return fmt.Sprintf(colorBold+"%-8s  %-36s  %21s  %34s  %-10s"+colorReset,
+	return fmt.Sprintf(colorBold+"%-8s  %-36s  %21s  %34s  %10s"+colorReset,
 		"PID",
 		"UUID",
 		"used % max",
@@ -306,20 +324,30 @@ func formatProcessLine(info ProcessInfo) string {
 	shrMem := formatMemory(info.ShrMB)
 	totalMem := formatMemory(float64(info.AllocatedMB))
 
-	return fmt.Sprintf("%-8d  %-36s  %s%5.1f%% %5.1f%% %2dvcpu%s  %s%6s %6s %6s %7s %5.1f%%%s  %-10d",
+	// Format OOM score with sign
+	oomScore := fmt.Sprintf("%+d", info.OOMScore)
+
+	return fmt.Sprintf("%-8d  %-36s  %s%5.1f%% %5.1f%% %2dvcpu%s  %s%6s %6s %6s %7s %5.1f%%%s  %10s",
 		info.PID,
 		info.UUID,
 		colorCyan, info.CPUUsage, info.CPUUsagePerc, info.CPUCores, colorReset,
 		colorPurple, virtMem, resMem, shrMem, totalMem, info.MemUsagePerc, colorReset,
-		info.OOMScore,
+		oomScore,
 	)
 }
 
 // getHeader returns the complete header including timestamp and instructions
 func getHeader() []string {
 	timeStr := time.Now().Format("2006-01-02 15:04:05")
+	sysInfo := getSystemInfo()
+
+	processData.RLock()
+	summary := calculateSummary(processData.info)
+	processData.RUnlock()
+
 	return []string{
 		fmt.Sprintf(colorBold+"QEMU Processes Monitor v%s (%s) - %s"+colorReset, Version, GitCommit[:7], timeStr),
+		formatSummary(sysInfo, summary),
 		fmt.Sprintf(colorCyan + "Press Ctrl+C to exit" + colorReset),
 		strings.Repeat("─", 120),
 		formatHeader(),
@@ -457,6 +485,81 @@ func runCLI(conf *Config, done chan bool) {
 			return
 		}
 	}
+}
+
+// getSystemInfo retrieves system resource information
+func getSystemInfo() SystemInfo {
+	var info SystemInfo
+
+	// Get CPU count from /proc/cpuinfo
+	content, err := os.ReadFile("/proc/cpuinfo")
+	if err == nil {
+		// Count processor entries in /proc/cpuinfo
+		processors := strings.Count(string(content), "processor")
+		if processors > 0 {
+			info.TotalCPUs = processors
+		}
+	}
+
+	// Get total memory from /proc/meminfo
+	content, err = os.ReadFile("/proc/meminfo")
+	if err == nil {
+		scanner := bufio.NewScanner(strings.NewReader(string(content)))
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.HasPrefix(line, "MemTotal:") {
+				fields := strings.Fields(line)
+				if len(fields) >= 2 {
+					memKB, _ := strconv.ParseInt(fields[1], 10, 64)
+					info.TotalMemoryMB = int(memKB / 1024)
+					break
+				}
+			}
+		}
+	}
+
+	// Get load averages from /proc/loadavg
+	content, err = os.ReadFile("/proc/loadavg")
+	if err == nil {
+		fields := strings.Fields(string(content))
+		if len(fields) >= 3 {
+			info.LoadAvg1, _ = strconv.ParseFloat(fields[0], 64)
+			info.LoadAvg5, _ = strconv.ParseFloat(fields[1], 64)
+			info.LoadAvg15, _ = strconv.ParseFloat(fields[2], 64)
+		}
+	}
+
+	return info
+}
+
+// calculateSummary calculates summary statistics for all processes
+func calculateSummary(processes []ProcessInfo) Summary {
+	var summary Summary
+	summary.ProcessCount = len(processes)
+
+	for _, p := range processes {
+		summary.TotalCPUUsage += p.CPUUsage
+		summary.TotalMemoryMB += p.ResMB
+		summary.TotalCores += p.CPUCores
+		summary.TotalMemAlloc += p.AllocatedMB
+	}
+
+	return summary
+}
+
+// formatSummary formats the summary line
+func formatSummary(sys SystemInfo, sum Summary) string {
+	return fmt.Sprintf(colorBold+"System: %d CPUs, %s RAM, Load: %.2f %.2f %.2f | QEMU: %d procs, CPU: %.1f%% (%d cores), MEM: %s/%s (%.1f%%)"+colorReset,
+		sys.TotalCPUs,
+		formatMemory(float64(sys.TotalMemoryMB)),
+		sys.LoadAvg1, sys.LoadAvg5, sys.LoadAvg15,
+		sum.ProcessCount,
+		sum.TotalCPUUsage,
+		sum.TotalCores,
+		formatMemory(sum.TotalMemoryMB),
+		formatMemory(float64(sum.TotalMemAlloc)),
+		(sum.TotalMemoryMB/float64(sum.TotalMemAlloc))*100,
+	)
 }
 
 func main() {
