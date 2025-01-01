@@ -1,3 +1,18 @@
+// QEMU Process Monitor
+//
+// This tool monitors QEMU processes for a specific user, displaying resource usage
+// including CPU, memory, and OOM score. It provides both CLI and HTTP interfaces
+// for monitoring.
+//
+// Features:
+// - Real-time monitoring of QEMU processes
+// - CPU usage tracking (total and per-core percentage)
+// - Memory usage tracking (virtual, resident, shared)
+// - OOM score monitoring
+// - HTTP endpoints for JSON and Prometheus metrics
+// - Color-coded output for better visibility
+// - Auto-refresh display
+
 package main
 
 import (
@@ -21,20 +36,29 @@ import (
 	"time"
 )
 
+// Version information, will be set during build
+var (
+	Version   = "dev"
+	GitCommit = "unknown"
+	BuildTime = "unknown"
+)
+
+// ProcessInfo represents the resource usage information for a QEMU process
 type ProcessInfo struct {
 	PID          int     `json:"pid"`
 	UUID         string  `json:"uuid"`
-	CPUUsage     float64 `json:"cpu_usage"`
-	CPUCores     int     `json:"cpu_cores"`
-	CPUUsagePerc float64 `json:"cpu_usage_perc"`
-	VirtMB       float64 `json:"virt_mb"`
-	ResMB        float64 `json:"res_mb"`
-	ShrMB        float64 `json:"shr_mb"`
-	AllocatedMB  int     `json:"allocated_mb"`
-	MemUsagePerc float64 `json:"mem_usage_perc"`
-	OOMScore     int     `json:"oom_score"`
+	CPUUsage     float64 `json:"cpu_usage"`      // Raw CPU usage percentage
+	CPUCores     int     `json:"cpu_cores"`      // Number of allocated CPU cores
+	CPUUsagePerc float64 `json:"cpu_usage_perc"` // CPU usage percentage relative to allocated cores
+	VirtMB       float64 `json:"virt_mb"`        // Virtual memory size in MB
+	ResMB        float64 `json:"res_mb"`         // Resident memory size in MB
+	ShrMB        float64 `json:"shr_mb"`         // Shared memory size in MB
+	AllocatedMB  int     `json:"allocated_mb"`   // Allocated memory in MB
+	MemUsagePerc float64 `json:"mem_usage_perc"` // Memory usage percentage
+	OOMScore     int     `json:"oom_score"`      // OOM score (0-1000)
 }
 
+// Config holds the runtime configuration
 type Config struct {
 	Username      string
 	RefreshRate   time.Duration
@@ -43,7 +67,7 @@ type Config struct {
 	EnableMetrics bool
 }
 
-// ANSI escape sequences
+// ANSI escape sequences for terminal control
 const (
 	clearScreen     = "\033[2J"
 	clearLine       = "\033[2K"
@@ -54,6 +78,7 @@ const (
 	moveUp          = "\033[1A"
 )
 
+// ANSI color codes for output formatting
 const (
 	colorReset  = "\033[0m"
 	colorRed    = "\033[31m"
@@ -67,14 +92,20 @@ const (
 )
 
 var (
-	uuidRegex   = regexp.MustCompile(`/run/vm/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/`)
-	lastOutput  []string
+	// Regex pattern to extract VM UUID from process command line
+	uuidRegex = regexp.MustCompile(`/run/vm/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/`)
+
+	// Store the last output for differential display updates
+	lastOutput []string
+
+	// Global process data with mutex protection
 	processData struct {
 		sync.RWMutex
 		info []ProcessInfo
 	}
 )
 
+// getCurrentUsername returns the current user's username
 func getCurrentUsername() string {
 	currentUser, err := user.Current()
 	if err != nil {
@@ -83,6 +114,7 @@ func getCurrentUsername() string {
 	return currentUser.Username
 }
 
+// parseAllocatedResources extracts allocated CPU cores and memory from QEMU command line
 func parseAllocatedResources(pid int) (cpuCores int, memoryMB int) {
 	cmd := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command", "--no-headers")
 	output, err := cmd.Output()
@@ -92,11 +124,13 @@ func parseAllocatedResources(pid int) (cpuCores int, memoryMB int) {
 
 	cmdLine := string(output)
 
+	// Extract CPU cores from -smp parameter
 	smpRegex := regexp.MustCompile(`-smp\s+(\d+)`)
 	if matches := smpRegex.FindStringSubmatch(cmdLine); len(matches) > 1 {
 		cpuCores, _ = strconv.Atoi(matches[1])
 	}
 
+	// Extract memory size from -m parameter
 	memRegex := regexp.MustCompile(`-m\s+(\d+)(M|G)?`)
 	if matches := memRegex.FindStringSubmatch(cmdLine); len(matches) > 1 {
 		mem, _ := strconv.Atoi(matches[1])
@@ -114,6 +148,7 @@ func parseAllocatedResources(pid int) (cpuCores int, memoryMB int) {
 	return cpuCores, memoryMB
 }
 
+// getQemuProcesses returns a list of QEMU process IDs for the specified user
 func getQemuProcesses(username string) []int {
 	cmd := exec.Command("pgrep", "-f", fmt.Sprintf("qemu.*%s", username))
 	output, err := cmd.Output()
@@ -134,6 +169,7 @@ func getQemuProcesses(username string) []int {
 	return pids
 }
 
+// getProcessUUID extracts the VM UUID from the process command line
 func getProcessUUID(pid int) string {
 	cmd := exec.Command("ps", "-p", strconv.Itoa(pid), "-f")
 	output, err := cmd.Output()
@@ -148,6 +184,7 @@ func getProcessUUID(pid int) string {
 	return "N/A"
 }
 
+// readProcFile reads a file from the /proc filesystem
 func readProcFile(pid int, filename string) (string, error) {
 	path := filepath.Join("/proc", strconv.Itoa(pid), filename)
 	content, err := os.ReadFile(path)
@@ -157,6 +194,7 @@ func readProcFile(pid int, filename string) (string, error) {
 	return string(content), nil
 }
 
+// getCPUUsage returns the CPU usage percentage for a process
 func getCPUUsage(pid int) float64 {
 	cmd := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "%cpu", "--no-headers")
 	output, err := cmd.Output()
@@ -170,6 +208,7 @@ func getCPUUsage(pid int) float64 {
 	return cpu
 }
 
+// getMemoryInfo returns virtual, resident, and shared memory usage in MB
 func getMemoryInfo(pid int) (float64, float64, float64) {
 	content, err := readProcFile(pid, "status")
 	if err != nil {
@@ -200,6 +239,7 @@ func getMemoryInfo(pid int) (float64, float64, float64) {
 	return float64(vmSize) / 1024, float64(vmRSS) / 1024, float64(rssFile+rssShmem) / 1024
 }
 
+// getOOMScore returns the OOM score for a process
 func getOOMScore(pid int) int {
 	content, err := readProcFile(pid, "oom_score")
 	if err != nil {
@@ -212,6 +252,7 @@ func getOOMScore(pid int) int {
 	return score
 }
 
+// getProcessInfo collects all resource usage information for a process
 func getProcessInfo(pid int) ProcessInfo {
 	cpuUsage := getCPUUsage(pid)
 	virtMB, resMB, shrMB := getMemoryInfo(pid)
@@ -219,7 +260,8 @@ func getProcessInfo(pid int) ProcessInfo {
 	uuid := getProcessUUID(pid)
 	cpuCores, allocatedMB := parseAllocatedResources(pid)
 
-	cpuUsagePerc := cpuUsage / float64(cpuCores)
+	// Calculate CPU usage percentage relative to allocated cores
+	cpuUsagePerc := (cpuUsage / float64(cpuCores*100)) * 100
 	memUsagePerc := resMB / float64(allocatedMB) * 100
 
 	return ProcessInfo{
@@ -237,18 +279,18 @@ func getProcessInfo(pid int) ProcessInfo {
 	}
 }
 
+// formatHeader returns the formatted header string for the display
 func formatHeader() string {
-	return fmt.Sprintf(colorBold+"%-8s  %-36s  %-16s  %-16s  %-16s  %-10s"+colorReset,
+	return fmt.Sprintf(colorBold+"%-8s  %-36s  %21s  %34s  %-10s"+colorReset,
 		"PID",
 		"UUID",
-		"CPU(used/max)",
-		"MEM(used/max)",
-		"USAGE(cpu/mem)",
+		"used % max",
+		"virt res shr max %",
 		"OOM",
 	)
 }
 
-// 格式化数值为人类可读格式
+// formatMemory formats memory values in a human-readable format (MB/GB)
 func formatMemory(mb float64) string {
 	if mb >= 1024 {
 		return fmt.Sprintf("%.1fG", mb/1024)
@@ -256,56 +298,43 @@ func formatMemory(mb float64) string {
 	return fmt.Sprintf("%.0fM", mb)
 }
 
-func getUsageColor(usage float64) string {
-	switch {
-	case usage >= 90:
-		return colorRed
-	case usage >= 75:
-		return colorYellow
-	default:
-		return colorGreen
-	}
-}
-
+// formatProcessLine formats a single process line for display
 func formatProcessLine(info ProcessInfo) string {
-	// 计算使用率颜色
-	cpuColor := getUsageColor(info.CPUUsagePerc)
-	memColor := getUsageColor(info.MemUsagePerc)
-
-	// 格式化内存数值
-	usedMem := formatMemory(info.ResMB)
+	// Format memory values
+	virtMem := formatMemory(info.VirtMB)
+	resMem := formatMemory(info.ResMB)
+	shrMem := formatMemory(info.ShrMB)
 	totalMem := formatMemory(float64(info.AllocatedMB))
 
-	return fmt.Sprintf("%-8d  %-36s  %s%5.1f%%/%-4d%s  %s%-7s/%-7s%s  %s%5.1f%%%s/%s%5.1f%%%s  %-10d",
+	return fmt.Sprintf("%-8d  %-36s  %s%5.1f%% %5.1f%% %2dvcpu%s  %s%6s %6s %6s %7s %5.1f%%%s  %-10d",
 		info.PID,
 		info.UUID,
-		colorBlue, info.CPUUsage, info.CPUCores, colorReset,
-		colorBlue, usedMem, totalMem, colorReset,
-		cpuColor, info.CPUUsagePerc, colorReset,
-		memColor, info.MemUsagePerc, colorReset,
+		colorCyan, info.CPUUsage, info.CPUUsagePerc, info.CPUCores, colorReset,
+		colorPurple, virtMem, resMem, shrMem, totalMem, info.MemUsagePerc, colorReset,
 		info.OOMScore,
 	)
 }
 
+// getHeader returns the complete header including timestamp and instructions
 func getHeader() []string {
 	timeStr := time.Now().Format("2006-01-02 15:04:05")
 	return []string{
-		fmt.Sprintf(colorBold+"QEMU Processes Monitor - %s"+colorReset, timeStr),
+		fmt.Sprintf(colorBold+"QEMU Processes Monitor v%s (%s) - %s"+colorReset, Version, GitCommit[:7], timeStr),
 		fmt.Sprintf(colorCyan + "Press Ctrl+C to exit" + colorReset),
-		strings.Repeat("─", 120), // 使用更好看的分隔线
+		strings.Repeat("─", 120),
 		formatHeader(),
 		strings.Repeat("─", 120),
 	}
 }
 
-// 优化显示函数
+// updateDisplay updates the terminal display with current process information
 func updateDisplay(processes []ProcessInfo) {
 	var currentOutput []string
 
-	// 生成当前输出内容
+	// Generate current output content
 	currentOutput = append(currentOutput, getHeader()...)
 
-	// 按 CPU 使用率排序
+	// Sort processes by CPU usage percentage
 	sort.Slice(processes, func(i, j int) bool {
 		return processes[i].CPUUsagePerc > processes[j].CPUUsagePerc
 	})
@@ -315,7 +344,7 @@ func updateDisplay(processes []ProcessInfo) {
 	}
 	currentOutput = append(currentOutput, strings.Repeat("─", 120))
 
-	// 如果是第一次输出，清屏并打印所有内容
+	// Handle first display
 	if len(lastOutput) == 0 {
 		fmt.Print(clearScreen + moveToTop)
 		for _, line := range currentOutput {
@@ -325,10 +354,8 @@ func updateDisplay(processes []ProcessInfo) {
 		return
 	}
 
-	// 移动到屏幕顶部
+	// Update changed lines only
 	fmt.Print(moveToTop)
-
-	// 更新发生变化的行
 	maxLines := max(len(currentOutput), len(lastOutput))
 	for i := 0; i < maxLines; i++ {
 		fmt.Print(clearLine)
@@ -342,6 +369,7 @@ func updateDisplay(processes []ProcessInfo) {
 	lastOutput = currentOutput
 }
 
+// max returns the larger of two integers
 func max(a, b int) int {
 	if a > b {
 		return a
@@ -349,6 +377,7 @@ func max(a, b int) int {
 	return b
 }
 
+// updateProcessData updates the global process information
 func updateProcessData(username string) {
 	var infos []ProcessInfo
 	for _, pid := range getQemuProcesses(username) {
@@ -361,6 +390,8 @@ func updateProcessData(username string) {
 }
 
 // HTTP Handlers
+
+// handleJSON serves process information in JSON format
 func handleJSON(w http.ResponseWriter, r *http.Request) {
 	processData.RLock()
 	defer processData.RUnlock()
@@ -369,6 +400,7 @@ func handleJSON(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(processData.info)
 }
 
+// handlePrometheus serves process information in Prometheus metrics format
 func handlePrometheus(w http.ResponseWriter, r *http.Request) {
 	processData.RLock()
 	defer processData.RUnlock()
@@ -394,6 +426,7 @@ func handlePrometheus(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// startHTTPServer starts the HTTP server for metrics endpoints
 func startHTTPServer(listenAddr string) {
 	http.HandleFunc("/metrics", handlePrometheus)
 	http.HandleFunc("/json", handleJSON)
@@ -406,11 +439,11 @@ func startHTTPServer(listenAddr string) {
 	}()
 }
 
+// runCLI runs the command-line interface
 func runCLI(conf *Config, done chan bool) {
 	ticker := time.NewTicker(conf.RefreshRate)
 	defer ticker.Stop()
 
-	// Hide cursor
 	fmt.Print(hideCursor)
 	defer fmt.Print(showCursor)
 
