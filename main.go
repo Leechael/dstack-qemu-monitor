@@ -168,7 +168,10 @@ func parseAllocatedResources(pid int) (cpuCores int, memoryMB int) {
 
 // getQemuProcesses returns a list of QEMU process IDs for the specified user
 func getQemuProcesses(username string) []int {
-	cmd := exec.Command("pgrep", "-f", fmt.Sprintf("qemu.*%s", username))
+	// Use pgrep with both user and pattern filtering for precise matching
+	// -u ensures only processes owned by the specific user are matched
+	// -f searches the full command line for "qemu"
+	cmd := exec.Command("pgrep", "-u", username, "-f", "qemu")
 	output, err := cmd.Output()
 	if err != nil {
 		return []int{}
